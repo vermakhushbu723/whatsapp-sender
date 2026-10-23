@@ -1075,6 +1075,7 @@ function Safety({ wa, optouts, reloadOptouts, onSaved }) {
 }
 
 function Inbox() {
+  const [view, setView] = useState('replies'); // replies | sent
   const [list, setList] = useState(null);
   const [filter, setFilter] = useState('all');
   const [open, setOpen] = useState(null); // selected number
@@ -1136,6 +1137,18 @@ function Inbox() {
   return (
     <div className={`inbox ${open ? 'has-thread' : ''}`}>
       <section className="card inbox-list">
+        <div className="mode-switch">
+          <button className={view === 'replies' ? 'on' : ''} onClick={() => setView('replies')}>
+            💬 Replies
+          </button>
+          <button className={view === 'sent' ? 'on' : ''} onClick={() => setView('sent')}>
+            📊 Sent status
+          </button>
+        </div>
+        {view === 'sent' ? (
+          <SentStatus open={open} onOpen={setOpen} />
+        ) : (
+          <>
         <div className="card-head">
           <h2>Inbox</h2>
           {perm === 'default' && (
@@ -1188,6 +1201,8 @@ function Inbox() {
               </li>
             ))}
           </ul>
+        )}
+          </>
         )}
       </section>
 
@@ -1255,6 +1270,126 @@ function Inbox() {
         </section>
       )}
     </div>
+  );
+}
+
+
+const SENT_FILTERS = [
+  ['all', 'Sab'],
+  ['read', '👁 Read'],
+  ['delivered', '✓✓ Delivered (padha nahi)'],
+  ['sent', '✓ Sent (pahuncha nahi abhi)'],
+  ['failed', '⚠ Failed'],
+  ['replied', '💬 Reply kiya'],
+];
+
+function SentStatus({ open, onOpen }) {
+  const [days, setDays] = useState(7);
+  const [data, setData] = useState(null);
+  const [filter, setFilter] = useState('all');
+
+  useEffect(() => {
+    let alive = true;
+    const load = () =>
+      api(`/api/sent-status?days=${days}`)
+        .then((d) => alive && setData(d))
+        .catch(() => {});
+    load();
+    const id = setInterval(load, 10000);
+    return () => {
+      alive = false;
+      clearInterval(id);
+    };
+  }, [days]);
+
+  const c = data?.counts || {};
+  const pct = (n) => (c.total ? Math.round((n / c.total) * 100) : 0);
+  // read also means delivered
+  const deliveredTotal = (c.delivered || 0) + (c.read || 0);
+  const rows = (data?.rows || []).filter((r) =>
+    filter === 'all' ? true : filter === 'replied' ? r.replied : r.status === filter
+  );
+
+  return (
+    <>
+      <div className="card-head">
+        <h2>Sent status</h2>
+        <select className="text-input days" value={days} onChange={(e) => setDays(Number(e.target.value))}>
+          <option value={1}>Aaj / 24 ghante</option>
+          <option value={7}>Pichhle 7 din</option>
+          <option value={30}>Pichhle 30 din</option>
+          <option value={90}>Pichhle 90 din</option>
+        </select>
+      </div>
+      <p className="hint">Jitne logon ko message bheja, unme kis tak pahuncha aur kisne padha.</p>
+
+      {data === null ? (
+        <p className="hint">Loading…</p>
+      ) : (
+        <>
+          <div className="stats">
+            <div className="stat">
+              <b>{c.total || 0}</b>
+              <span>Bheje</span>
+            </div>
+            <div className="stat ok">
+              <b>{deliveredTotal}</b>
+              <span>Pahunche · {pct(deliveredTotal)}%</span>
+            </div>
+            <div className="stat read">
+              <b>{c.read || 0}</b>
+              <span>Padhe · {pct(c.read || 0)}%</span>
+            </div>
+            <div className="stat bad">
+              <b>{c.failed || 0}</b>
+              <span>Failed</span>
+            </div>
+            <div className="stat yes">
+              <b>{c.replied || 0}</b>
+              <span>Reply · {pct(c.replied || 0)}%</span>
+            </div>
+          </div>
+
+          <div className="filters">
+            {SENT_FILTERS.map(([k, label]) => (
+              <button key={k} className={`chip ${filter === k ? 'on' : ''}`} onClick={() => setFilter(k)}>
+                {label} ({k === 'all' ? c.total || 0 : c[k] || 0})
+              </button>
+            ))}
+          </div>
+
+          {!rows.length ? (
+            <p className="hint">Is filter me koi number nahi hai.</p>
+          ) : (
+            <ul className="convs">
+              {rows.map((r) => (
+                <li key={r.number} className={open === r.number ? 'on' : ''} onClick={() => onOpen(r.number)}>
+                  <div className="conv-top">
+                    <b>{r.name || `+${r.number}`}</b>
+                    <span className={`pill ${r.status === 'read' ? 'read' : r.status === 'failed' ? 'failed' : r.status === 'delivered' ? 'sent' : 'sending'}`}>
+                      {DELIVERY_LABEL[r.status] || r.status}
+                    </span>
+                  </div>
+                  <div className="conv-bottom">
+                    <span className="conv-text">{r.error ? `⚠ ${r.error}` : r.template ? `📋 ${r.template}` : r.text}</span>
+                    {r.replied && <span className="pill dup">💬 Reply</span>}
+                  </div>
+                  <div className="hint conv-num">
+                    {r.name && `+${r.number} · `}
+                    {fmtDate(r.time)}
+                    {r.count > 1 && ` · ${r.count} message`}
+                  </div>
+                </li>
+              ))}
+            </ul>
+          )}
+          <p className="hint small-note">
+            "Read" tabhi dikhta hai jab us insaan ne WhatsApp me <b>read receipts (blue tick) ON</b> rakhe hon. Blue tick
+            band ho to padhne ke baad bhi "Delivered" hi dikhega.
+          </p>
+        </>
+      )}
+    </>
   );
 }
 

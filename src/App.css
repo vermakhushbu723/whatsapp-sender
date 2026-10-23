@@ -351,3 +351,20 @@ nav button.active { background: #1f2c33; color: #fff; }
 .mode-switch button { border: 0; background: none; padding: 9px; border-radius: 8px; font-weight: 600; color: var(--muted); }
 .mode-switch button.on { background: #fff; color: var(--green-dark); box-shadow: 0 1px 2px rgba(0,0,0,.1); }
 .cloud .notice { margin: 0; }
+
+/* sent status */
+.stats { display: grid; grid-template-columns: repeat(5, 1fr); gap: 6px; margin-bottom: 12px; }
+.stat { background: #f0f2f5; border-radius: 8px; padding: 8px 6px; text-align: center; }
+.stat b { display: block; font-size: 18px; }
+.stat span { font-size: 11px; color: var(--muted); }
+.stat.ok b { color: var(--green-dark); }
+.stat.read b { color: #027eb5; }
+.stat.bad b { color: #b42318; }
+.stat.yes b { color: #6d28d9; }
+.pill.read { background: #e0f2fe; color: #027eb5; }
+.text-input.days { width: auto; padding: 6px 8px; font-size: 13px; }
+.small-note { font-size: 11px; margin-top: 10px; }
+.inbox-list .mode-switch { margin-bottom: 12px; }
+@media (max-width: 400px) {
+  .stats { grid-template-columns: repeat(3, 1fr); }
+}

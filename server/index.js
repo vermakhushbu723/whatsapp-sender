@@ -66,6 +66,8 @@ async function optedOut(numbers) {
 // "yes", "haan", "interested" ... at the start of a reply -> highlighted as a lead
 const YES_RE = /^\s*(yes|yess+|yeah|yup|haan|han|ha|haa|ji haan|ji|interested|ok|okay|sure|call me)\b/i;
 const REPLY_WINDOW_MS = 24 * 60 * 60 * 1000; // free-form replies are allowed for 24h after the customer writes
+// delivery receipts only move forward: sent -> delivered -> read
+const LATER_STATUSES = { sent: ['delivered', 'read'], delivered: ['read'], read: [], failed: [] };
 
 async function saveMessage(msg) {
   const doc = { read: msg.direction === 'out', ...msg };
@@ -361,15 +363,20 @@ app.post(
     const { incoming, statuses } = parseWebhook(req.body);
     for (const m of incoming) await handleIncoming(m);
     for (const st of statuses) {
+      // Meta can deliver receipts out of order — never move read back to delivered/sent
+      const later = LATER_STATUSES[st.status] || [];
       await col
         .messages()
-        .updateOne({ _id: st.id }, { $set: { delivery: st.status, ...(st.error && { error: st.error }) } });
+        .updateOne(
+          { _id: st.id, delivery: { $nin: later } },
+          { $set: { delivery: st.status, ...(st.error && { error: st.error }) } }
+        );
       const live = currentJob?.results.find((r) => r.wamid === st.id);
-      if (live) Object.assign(live, { delivery: st.status }, st.error && { error: st.error });
+      if (live && !later.includes(live.delivery)) Object.assign(live, { delivery: st.status }, st.error && { error: st.error });
       await col
         .jobs()
         .updateOne(
-          { 'results.wamid': st.id },
+          { results: { $elemMatch: { wamid: st.id, delivery: { $nin: later } } } },
           { $set: { 'results.$.delivery': st.status, ...(st.error && { 'results.$.error': st.error }) } }
         );
     }
@@ -575,6 +582,55 @@ app.get(
         stop: !!c.stop,
       }))
     );
+  })
+);
+
+// delivery status of everyone we messaged: last message per number + whether they replied after it
+app.get(
+  '/api/sent-status',
+  wrap(async (req, res) => {
+    const days = Math.min(Math.max(Number(req.query.days) || 7, 1), 90);
+    const since = new Date(Date.now() - days * 24 * 60 * 60 * 1000).toISOString();
+    const [sent, replies] = await Promise.all([
+      col
+        .messages()
+        .aggregate([
+          { $match: { direction: 'out', time: { $gte: since } } },
+          { $sort: { time: 1 } },
+          { $group: { _id: '$number', last: { $last: '$$ROOT' }, count: { $sum: 1 } } },
+          { $sort: { 'last.time': -1 } },
+          { $limit: 5000 },
+        ])
+        .toArray(),
+      col
+        .messages()
+        .aggregate([
+          { $match: { direction: 'in', time: { $gte: since } } },
+          { $group: { _id: '$number', lastIn: { $max: '$time' }, name: { $max: '$name' } } },
+        ])
+        .toArray(),
+    ]);
+    const inMap = Object.fromEntries(replies.map((r) => [r._id, r]));
+    const rows = sent.map(({ _id: number, last, count }) => {
+      const reply = inMap[number];
+      return {
+        number,
+        name: reply?.name || '',
+        text: last.text,
+        template: last.template || null,
+        time: last.time,
+        status: last.delivery || 'sent', // sent | delivered | read | failed
+        error: last.error || null,
+        count,
+        replied: !!reply && reply.lastIn > last.time,
+      };
+    });
+    const counts = { total: rows.length, sent: 0, delivered: 0, read: 0, failed: 0, replied: 0 };
+    for (const r of rows) {
+      counts[r.status] = (counts[r.status] || 0) + 1;
+      if (r.replied) counts.replied++;
+    }
+    res.json({ days, counts, rows });
   })
 );
 
