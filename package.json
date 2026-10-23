@@ -9,13 +9,9 @@
     "start": "vite build && node server/index.js"
   },
   "dependencies": {
-    "@hapi/boom": "^10.0.1",
-    "@whiskeysockets/baileys": "^6.7.24",
     "cors": "^2.8.6",
     "express": "^5.3.0",
     "mongodb": "^7.7.0",
-    "pino": "^10.4.0",
-    "qrcode": "^1.5.4",
     "react": "^19.3.1",
     "react-dom": "^19.3.1",
     "xlsx": "https://cdn.sheetjs.com/xlsx-0.20.3/xlsx-0.20.3.tgz"

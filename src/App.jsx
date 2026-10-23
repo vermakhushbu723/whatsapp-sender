@@ -1,6 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
 
-const MAX = 20;
 const DEFAULT_COUNTRY_CODE = '91';
 
 const STATUS_LABEL = {
@@ -8,7 +7,11 @@ const STATUS_LABEL = {
   sending: 'Sending…',
   sent: 'Sent ✓',
   failed: 'Failed',
+  skipped: 'Skipped (STOP)',
 };
+
+// delivery receipts from the official API webhook
+const DELIVERY_LABEL = { sent: 'Sent ✓', delivered: 'Delivered ✓✓', read: 'Read ✓✓', failed: 'Failed' };
 
 async function api(url, options) {
   const res = await fetch(url, {
@@ -16,7 +19,7 @@ async function api(url, options) {
     ...options,
   });
   const data = await res.json().catch(() => ({}));
-  if (!res.ok) throw new Error(data.error || 'Server error');
+  if (!res.ok) throw Object.assign(new Error(data.error || 'Server error'), { status: res.status });
   return data;
 }
 
@@ -58,8 +61,8 @@ const imgUrl = (name) => `/api/uploads/${name}`;
 
 // pick an image file -> upload -> returns saved file name
 async function uploadImage(file) {
-  if (!file.type.startsWith('image/')) throw new Error('Sirf image file chunein (JPG, PNG, WEBP).');
-  if (file.size > 15 * 1024 * 1024) throw new Error('Image 15MB se chhoti honi chahiye.');
+  if (!['image/jpeg', 'image/png'].includes(file.type)) throw new Error('Sirf JPG ya PNG image chunein.');
+  if (file.size > 5 * 1024 * 1024) throw new Error('Image 5MB se chhoti honi chahiye (WhatsApp ki limit).');
   const data = await new Promise((resolve, reject) => {
     const r = new FileReader();
     r.onload = () => resolve(r.result);
@@ -71,35 +74,40 @@ async function uploadImage(file) {
 }
 
 export default function App() {
-  const [wa, setWa] = useState({ loading: true, accounts: [] });
+  const [wa, setWa] = useState({ loading: true });
   const [numbers, setNumbers] = useState(['']);
   const [pasteText, setPasteText] = useState('');
-  const [message, setMessage] = useState('');
   const [error, setError] = useState('');
   const [notice, setNotice] = useState(null);
   const [history, setHistory] = useState([]);
   const [resend, setResend] = useState(false);
   const [tab, setTab] = useState('send');
   const [dismissedJob, setDismissedJob] = useState(null);
+  const [showPassword, setShowPassword] = useState(false);
   const [image, setImage] = useState(null);
   const [uploading, setUploading] = useState(false);
-  const [templates, setTemplates] = useState([]);
-  const [templateId, setTemplateId] = useState(null);
+  const [optouts, setOptouts] = useState([]);
+  const [templates, setTemplates] = useState({ list: [], error: '', loading: false });
+  const [templateKey, setTemplateKey] = useState('');
+  const [params, setParams] = useState([]);
+  const [mode, setMode] = useState('template'); // template | custom
+  const [customText, setCustomText] = useState('');
+  const [windows, setWindows] = useState({}); // number -> when its 24h reply window closes
   const imageRef = useRef(null);
-
-  const loadTemplates = () => api('/api/templates').then(setTemplates).catch(() => {});
-  useEffect(() => {
-    loadTemplates();
-  }, []);
   const fileRef = useRef(null);
 
-  // poll connection + job status
+  const loadOptouts = () => api('/api/optouts').then(setOptouts).catch(() => {});
+  useEffect(() => {
+    loadOptouts();
+  }, [tab]);
+
+  // poll sender + job status
   useEffect(() => {
     let alive = true;
     const tick = () =>
       api('/api/status')
         .then((d) => alive && setWa(d))
-        .catch(() => alive && setWa({ serverDown: true, accounts: [] }));
+        .catch((e) => alive && setWa(e.status === 401 ? { needLogin: true } : { serverDown: true }));
     tick();
     const id = setInterval(tick, 2000);
     return () => {
@@ -110,11 +118,51 @@ export default function App() {
 
   const job = wa.job;
   const sending = !!job && !job.done;
-  const activeAcc = wa.accounts.find((a) => a.id === wa.active);
+
+  const lastUnread = useRef(null);
+  useEffect(() => {
+    const n = wa.unread;
+    if (n === undefined) return;
+    document.title = n ? `(${n}) WA Sender` : 'WA Sender';
+    if (lastUnread.current !== null && n > lastUnread.current && 'Notification' in window && Notification.permission === 'granted')
+      new Notification('WA Sender — naya reply', { body: `${n} unread reply`, tag: 'wa-reply' });
+    lastUnread.current = n;
+  }, [wa.unread]);
+  const connected = wa.sender?.status === 'connected';
+  const MAX = wa.maxPerBatch || 250;
+  const tpl = templates.list.find((t) => `${t.name}|${t.language}` === templateKey);
+
+  const loadTemplates = () => {
+    setTemplates((c) => ({ ...c, loading: true, error: '' }));
+    api('/api/cloud/templates')
+      .then((list) => setTemplates({ list, error: '', loading: false }))
+      .catch((e) => setTemplates({ list: [], error: e.message, loading: false }));
+  };
+  useEffect(() => {
+    if (connected) loadTemplates();
+  }, [connected]);
+
+  // no approved template yet -> start on custom message
+  const autoMode = useRef(false);
+  useEffect(() => {
+    if (autoMode.current || templates.loading || templates.error || !connected) return;
+    autoMode.current = true;
+    if (!templates.list.length) setMode('custom');
+  }, [templates, connected]);
+
+  useEffect(() => {
+    if (!connected) return;
+    const load = () => api('/api/windows').then(setWindows).catch(() => {});
+    load();
+    const id = setInterval(load, 15000);
+    return () => clearInterval(id);
+  }, [connected, job?.done]);
 
   useEffect(() => {
     api('/api/history').then(setHistory).catch(() => {});
   }, [tab, job?.done]);
+
+  const optSet = useMemo(() => new Set(optouts.map((o) => o.number)), [optouts]);
 
   // number -> last time a message was successfully sent to it
   const sentMap = useMemo(() => {
@@ -136,15 +184,33 @@ export default function App() {
         if (norm in firstIndex) dupOf = firstIndex[norm] + 1;
         else firstIndex[norm] = i;
       }
-      return { value, norm, issue, dupOf, sentAt: !issue && sentMap[norm] };
+      return {
+        value,
+        norm,
+        issue,
+        dupOf,
+        sentAt: !issue && sentMap[norm],
+        blocked: !issue && optSet.has(norm),
+        windowEnds: !issue && windows[norm],
+      };
     });
-  }, [numbers, sentMap]);
+  }, [numbers, sentMap, optSet, windows]);
 
   const filledCount = rows.filter((r) => !r.empty).length;
   const invalidCount = rows.filter((r) => r.issue).length;
   const dupCount = rows.filter((r) => r.dupOf).length;
   const sentBeforeCount = rows.filter((r) => r.sentAt && !r.dupOf).length;
-  const sendable = rows.filter((r) => !r.empty && !r.issue && !r.dupOf && (resend || !r.sentAt));
+  const blockedCount = rows.filter((r) => r.blocked && !r.dupOf).length;
+  const isCustom = mode === 'custom';
+  const closedCount = isCustom ? rows.filter((r) => !r.empty && !r.issue && !r.dupOf && !r.blocked && !r.windowEnds).length : 0;
+  const sendable = rows.filter(
+    (r) => !r.empty && !r.issue && !r.dupOf && !r.blocked && (resend || !r.sentAt) && (!isCustom || r.windowEnds)
+  );
+  const messageReady = isCustom
+    ? !!(customText.trim() || image)
+    : !!tpl &&
+      params.slice(0, tpl.vars).filter((p) => p?.trim()).length === tpl.vars &&
+      (tpl.headerFormat !== 'IMAGE' || !!image);
 
   // ---------- adding numbers (paste / excel) ----------
   const addNumbers = (tokens, source) => {
@@ -239,24 +305,23 @@ export default function App() {
 
   const send = async () => {
     setError('');
-    if (!sendable.length) return setError('Bhejne ke liye koi naya sahi number nahi hai.');
-    if (!message.trim() && !image) return setError('Message likhein ya image lagayein.');
+    if (!sendable.length)
+      return setError(
+        isCustom
+          ? 'Custom message sirf unhe ja sakta hai jinhone pichhle 24 ghante me message kiya ho.'
+          : 'Bhejne ke liye koi naya sahi number nahi hai.'
+      );
+    if (!messageReady) return setError(isCustom ? 'Message likhein ya image lagayein.' : 'Template chunein aur saare khaane bharein.');
+    const nums = sendable.map((r) => r.norm);
+    const body = isCustom
+      ? { mode: 'custom', numbers: nums, message: customText, image }
+      : { numbers: nums, cloudTemplate: { name: tpl.name, language: tpl.language }, params, image };
     try {
-      const d = await api('/api/send', {
-        method: 'POST',
-        body: JSON.stringify({ numbers: sendable.map((r) => r.norm), message, image }),
-      });
+      const d = await api('/api/send', { method: 'POST', body: JSON.stringify(body) });
       setWa((w) => ({ ...w, job: d.job }));
     } catch (e) {
       setError(e.message);
     }
-  };
-
-  const applyTemplate = (t) => {
-    setMessage(t.text);
-    setImage(t.image);
-    setTemplateId(t.id);
-    setTab('send');
   };
 
   const pickImage = async (e) => {
@@ -266,38 +331,13 @@ export default function App() {
     setUploading(true);
     try {
       setImage(await uploadImage(file));
-      setTemplateId(null);
     } catch (err) {
       setError(err.message);
     }
     setUploading(false);
   };
 
-  const saveAsTemplate = async () => {
-    const name = prompt('Template ka naam dalein:', `Message ${templates.length + 1}`);
-    if (!name) return;
-    try {
-      const t = await api('/api/templates', { method: 'POST', body: JSON.stringify({ name, text: message, image }) });
-      setTemplateId(t.id);
-      loadTemplates();
-    } catch (err) {
-      setError(err.message);
-    }
-  };
-
   const refresh = () => api('/api/status').then(setWa).catch(() => {});
-
-  const accountAction = async (id, action) => {
-    if (action === 'logout' && !confirm(`Account ${id} ko WhatsApp se logout karna hai?`)) return;
-    try {
-      await api(`/api/accounts/${id}/${action}`, { method: 'POST' });
-      if (action === 'login') await api(`/api/accounts/${id}/select`, { method: 'POST' });
-      setError('');
-    } catch (e) {
-      alert(e.message);
-    }
-    refresh();
-  };
 
   const sentCount = job?.results.filter((r) => r.status === 'sent').length || 0;
   const failedCount = job?.results.filter((r) => r.status === 'failed').length || 0;
@@ -305,6 +345,13 @@ export default function App() {
   let sendLabel = `Send to ${sendable.length} number${sendable.length === 1 ? '' : 's'}`;
   if (sending) sendLabel = 'Sending…';
   else if (!sendable.length && sentBeforeCount) sendLabel = 'Sent ✓ — naya number dalein';
+
+  if (wa.needLogin) return <LoginScreen />;
+
+  const signOut = async () => {
+    await api('/api/auth/logout', { method: 'POST' }).catch(() => {});
+    window.location.reload();
+  };
 
   return (
     <div className="layout">
@@ -316,23 +363,46 @@ export default function App() {
           <button className={tab === 'send' ? 'active' : ''} onClick={() => setTab('send')}>
             Send Message
           </button>
-          <button className={tab === 'templates' ? 'active' : ''} onClick={() => setTab('templates')}>
-            Saved Messages
+          <button className={tab === 'inbox' ? 'active' : ''} onClick={() => setTab('inbox')}>
+            Inbox {wa.unread > 0 && <span className="badge">{wa.unread}</span>}
           </button>
           <button className={tab === 'history' ? 'active' : ''} onClick={() => setTab('history')}>
             History
           </button>
+          <button className={tab === 'safety' ? 'active' : ''} onClick={() => setTab('safety')}>
+            Limits & Opt-out
+          </button>
         </nav>
-        <AccountSwitcher wa={wa} sending={sending} onAction={accountAction} />
+        <SenderCard wa={wa} />
+        <div className="side-actions">
+          <button className="signout" onClick={() => setShowPassword(true)}>
+            🔑 {wa.authEnabled ? 'Password badlein' : 'Password lagayein'}
+          </button>
+          {wa.authEnabled && (
+            <button className="signout" onClick={signOut}>
+              ⎋ Sign out
+            </button>
+          )}
+        </div>
       </aside>
 
+      {showPassword && (
+        <ChangePassword
+          hasPassword={!!wa.authEnabled}
+          onClose={() => setShowPassword(false)}
+          onDone={() => setWa((w) => ({ ...w, authEnabled: true }))}
+        />
+      )}
+
       <main className="content">
-        {tab === 'history' ? (
+        {tab === 'inbox' ? (
+          <Inbox />
+        ) : tab === 'history' ? (
           <History history={history} />
-        ) : tab === 'templates' ? (
-          <Templates templates={templates} reload={loadTemplates} onUse={applyTemplate} />
-        ) : activeAcc?.status !== 'connected' ? (
-          <ConnectPanel wa={wa} account={activeAcc} onLogin={(id) => accountAction(id, 'login')} />
+        ) : tab === 'safety' ? (
+          <Safety wa={wa} optouts={optouts} reloadOptouts={loadOptouts} onSaved={refresh} />
+        ) : !connected ? (
+          <SenderProblem wa={wa} />
         ) : (
           <div className="grid">
             <section className="card">
@@ -377,11 +447,13 @@ export default function App() {
                 </div>
               )}
 
-              {(invalidCount > 0 || dupCount > 0 || sentBeforeCount > 0) && (
+              {(invalidCount > 0 || dupCount > 0 || sentBeforeCount > 0 || blockedCount > 0 || closedCount > 0) && (
                 <div className="summary">
                   {invalidCount > 0 && <span className="pill failed">⚠ {invalidCount} galat</span>}
+                  {blockedCount > 0 && <span className="pill failed">⛔ {blockedCount} opt-out</span>}
                   {dupCount > 0 && <span className="pill dup">⧉ {dupCount} duplicate</span>}
                   {sentBeforeCount > 0 && <span className="pill sent">✓ {sentBeforeCount} pehle bhej chuke</span>}
+                  {closedCount > 0 && <span className="pill sending">⏱ {closedCount} ko template chahiye</span>}
                   {(invalidCount > 0 || dupCount > 0) && (
                     <button className="link-btn" onClick={removeProblemRows} disabled={sending}>
                       Galat/duplicate hatao
@@ -393,7 +465,7 @@ export default function App() {
               <div className="numbers">
                 {numbers.map((n, i) => {
                   const r = rows[i];
-                  const state = r.issue ? 'bad' : r.dupOf ? 'dup' : r.sentAt ? 'done' : '';
+                  const state = r.issue || r.blocked ? 'bad' : r.dupOf ? 'dup' : r.sentAt ? 'done' : '';
                   return (
                     <div key={i}>
                       <div className="num-row">
@@ -412,8 +484,18 @@ export default function App() {
                       </div>
                       {r.issue && <div className="row-msg bad">⚠ {r.issue}</div>}
                       {r.dupOf && <div className="row-msg dup">⧉ Duplicate — ye number #{r.dupOf} par already hai</div>}
-                      {!r.dupOf && r.sentAt && (
+                      {!r.dupOf && r.blocked && (
+                        <div className="row-msg bad">⛔ Is number ne STOP kiya hai / opt-out list me hai — message nahi jayega</div>
+                      )}
+                      {!r.dupOf && !r.blocked && r.sentAt && (
                         <div className="row-msg done">✓ Is number par message ho chuka hai ({fmtDate(r.sentAt)})</div>
+                      )}
+                      {isCustom && !r.empty && !r.issue && !r.dupOf && !r.blocked && (
+                        r.windowEnds ? (
+                          <div className="row-msg done">💬 Custom ja sakta hai ({fmtDate(r.windowEnds)} tak)</div>
+                        ) : (
+                          <div className="row-msg dup">⏱ 24 ghante me reply nahi kiya — custom nahi jayega, template chahiye</div>
+                        )
                       )}
                     </div>
                   );
@@ -430,85 +512,61 @@ export default function App() {
             <section className="card">
               <div className="from-bar">
                 <span className="hint">Bhejne wala:</span>
-                <b>
-                  Account {activeAcc.id} · +{activeAcc.me?.id}
-                </b>
-                {activeAcc.me?.name && <span className="hint">({activeAcc.me.name})</span>}
-              </div>
-              {templates.length > 0 && (
-                <div className="tpl-chips">
-                  <span className="hint">Saved:</span>
-                  {templates.map((t, i) => (
-                    <button
-                      key={t.id}
-                      className={`chip ${templateId === t.id ? 'on' : ''}`}
-                      onClick={() => applyTemplate(t)}
-                      disabled={sending}
-                      title={t.text}
-                    >
-                      <b>{i + 1}</b> {t.name}
-                      {t.image && ' 🖼'}
-                    </button>
-                  ))}
-                </div>
-              )}
-              <h2>Message</h2>
-              <textarea
-                className="message"
-                rows={8}
-                value={message}
-                onChange={(e) => {
-                  setMessage(e.target.value);
-                  setTemplateId(null);
-                }}
-                placeholder="Apna message yaha likhein…"
-                disabled={sending}
-              />
-              <div className="attach-row">
-                {image ? (
-                  <div className="attach-preview">
-                    <img src={imgUrl(image)} alt="poster" />
-                    <div>
-                      <div className="attach-title">Image / poster lagi hai</div>
-                      <div className="hint">Message iska caption banega</div>
-                    </div>
-                    <button
-                      className="icon"
-                      onClick={() => {
-                        setImage(null);
-                        setTemplateId(null);
-                      }}
-                      disabled={sending}
-                      title="Image hatao"
-                    >
-                      ✕
-                    </button>
-                  </div>
-                ) : (
-                  <button className="ghost" onClick={() => imageRef.current?.click()} disabled={sending || uploading}>
-                    {uploading ? 'Upload ho raha hai…' : '🖼 Image / poster lagayein'}
-                  </button>
+                <b>+{wa.sender.phone}</b>
+                {wa.sender.name && <span className="hint">({wa.sender.name})</span>}
+                {wa.limit !== undefined && (
+                  <span className={`usage ${wa.usedToday >= wa.limit ? 'full' : ''}`}>
+                    Aaj: {wa.usedToday}/{wa.limit}
+                  </span>
                 )}
-                <button
-                  className="ghost"
-                  onClick={saveAsTemplate}
-                  disabled={sending || (!message.trim() && !image) || !!templateId}
-                  title={templateId ? 'Ye message pehle se saved hai' : ''}
-                >
-                  {templateId ? '✓ Saved message' : '💾 Save karein'}
-                </button>
-                <input ref={imageRef} type="file" accept="image/*" hidden onChange={pickImage} />
               </div>
+              <div className="mode-switch">
+                <button className={!isCustom ? 'on' : ''} onClick={() => setMode('template')} disabled={sending}>
+                  📋 Template
+                </button>
+                <button className={isCustom ? 'on' : ''} onClick={() => setMode('custom')} disabled={sending}>
+                  ✍ Custom message
+                </button>
+              </div>
+              {isCustom ? (
+                <CustomComposer
+                  text={customText}
+                  setText={setCustomText}
+                  image={image}
+                  setImage={setImage}
+                  pickImage={() => imageRef.current?.click()}
+                  uploading={uploading}
+                  sending={sending}
+                />
+              ) : (
+              <Composer
+                state={templates}
+                reload={loadTemplates}
+                tpl={tpl}
+                templateKey={templateKey}
+                setTemplateKey={(k) => {
+                  setTemplateKey(k);
+                  setParams([]);
+                }}
+                params={params}
+                setParams={setParams}
+                image={image}
+                setImage={setImage}
+                pickImage={() => imageRef.current?.click()}
+                uploading={uploading}
+                sending={sending}
+              />
+              )}
+              <input ref={imageRef} type="file" accept="image/jpeg,image/png" hidden onChange={pickImage} />
               <div className="msg-foot">
                 <label className="check">
                   <input type="checkbox" checked={resend} onChange={(e) => setResend(e.target.checked)} disabled={sending} />
                   Pehle bheje gaye numbers par dobara bhejein
                 </label>
-                <button className="primary" onClick={send} disabled={sending || uploading || !sendable.length || (!message.trim() && !image)}>
+                <button className="primary" onClick={send} disabled={sending || uploading || !sendable.length || !messageReady}>
                   {sendLabel}
                 </button>
               </div>
-              <div className="hint right">{message.length} characters</div>
               {error && <div className="error">{error}</div>}
 
               {job && !job.done && (
@@ -549,6 +607,7 @@ export default function App() {
 function SuccessMessage({ job, onClose }) {
   const sent = job.results.filter((r) => r.status === 'sent');
   const failed = job.results.filter((r) => r.status === 'failed');
+  const skipped = job.results.filter((r) => r.status === 'skipped');
   return (
     <div className="done-box">
       <button className="icon close" onClick={onClose} title="Close">
@@ -560,8 +619,8 @@ function SuccessMessage({ job, onClose }) {
           <div>
             <div className="success-title">Message successfully bhej diya gaya!</div>
             <div className="success-sub">
-              {sent.length} number{sent.length === 1 ? '' : 's'} par message pahuch gaya. Aap ise apne WhatsApp me bhi dekh
-              sakte hain.
+              {sent.length} number{sent.length === 1 ? '' : 's'} par message Meta ko de diya gaya. Delivered/Read status
+              History me dikhega.
             </div>
           </div>
         </div>
@@ -569,6 +628,11 @@ function SuccessMessage({ job, onClose }) {
         <div className="success fail">
           <div className="success-icon">!</div>
           <div className="success-title">Koi message nahi bheja ja saka.</div>
+        </div>
+      )}
+      {skipped.length > 0 && (
+        <div className="failed-list">
+          ⏭ {skipped.length} number skip hue: {skipped.map((r) => `+${r.number} (${r.error})`).join(', ')}
         </div>
       )}
       {failed.length > 0 && (
@@ -581,251 +645,615 @@ function SuccessMessage({ job, onClose }) {
   );
 }
 
-const ACC_STATUS = {
-  connected: 'Connected',
-  qr: 'QR scan karein',
-  connecting: 'Connecting…',
-  disconnected: 'Reconnecting…',
-  idle: 'Login nahi hai',
-};
+function LoginScreen() {
+  const [password, setPassword] = useState('');
+  const [err, setErr] = useState('');
+  const [busy, setBusy] = useState(false);
 
-function AccountSwitcher({ wa, sending, onAction }) {
-  if (wa.serverDown)
-    return (
-      <div className="accounts">
-        <div className="acc">
-          <div className="dot disconnected" />
-          <div className="acc-title">Server offline</div>
-        </div>
-      </div>
-    );
+  const submit = async (e) => {
+    e.preventDefault();
+    setBusy(true);
+    setErr('');
+    try {
+      await api('/api/auth/login', { method: 'POST', body: JSON.stringify({ password }) });
+      window.location.reload();
+    } catch (e2) {
+      setErr(e2.message);
+      setBusy(false);
+    }
+  };
 
   return (
-    <div className="accounts">
-      <div className="acc-heading">WhatsApp Accounts</div>
-      {wa.accounts.map((a) => {
-        const active = a.id === wa.active;
-        return (
-          <div
-            key={a.id}
-            className={`acc ${active ? 'active' : ''}`}
-            onClick={() => !active && !sending && onAction(a.id, 'select')}
-            title={active ? 'Abhi isi account se message jayenge' : 'Is account par switch karein'}
-          >
-            <div className={`dot ${a.status}`} />
-            <div className="acc-info">
-              <div className="acc-title">
-                Account {a.id}
-                {active && <span className="acc-tag">Active</span>}
-              </div>
-              <div className="acc-sub">{a.me ? `+${a.me.id}${a.me.name ? ` · ${a.me.name}` : ''}` : ACC_STATUS[a.status]}</div>
-            </div>
-            {a.status === 'idle' ? (
-              <button
-                className="acc-btn"
-                onClick={(e) => {
-                  e.stopPropagation();
-                  onAction(a.id, 'login');
-                }}
-              >
-                Login
-              </button>
-            ) : (
-              <button
-                className="acc-btn out"
-                disabled={sending && active}
-                onClick={(e) => {
-                  e.stopPropagation();
-                  onAction(a.id, 'logout');
-                }}
-              >
-                {a.status === 'connected' ? 'Logout' : 'Cancel'}
-              </button>
-            )}
-          </div>
-        );
-      })}
+    <div className="login-page">
+      <form className="card login-card" onSubmit={submit}>
+        <div className="login-logo">✆</div>
+        <h2>WA Sender</h2>
+        <p className="hint">Admin panel kholne ke liye password dalein.</p>
+        <input
+          className="text-input"
+          type="password"
+          value={password}
+          onChange={(e) => setPassword(e.target.value)}
+          placeholder="Password"
+          autoFocus
+          autoComplete="current-password"
+        />
+        {err && <div className="error">{err}</div>}
+        <button className="primary" disabled={busy || !password}>
+          {busy ? 'Checking…' : 'Login'}
+        </button>
+      </form>
     </div>
   );
 }
 
-function ConnectPanel({ wa, account, onLogin }) {
+function ChangePassword({ hasPassword, onClose, onDone }) {
+  const [current, setCurrent] = useState('');
+  const [next, setNext] = useState('');
+  const [confirmPw, setConfirmPw] = useState('');
+  const [show, setShow] = useState(false);
+  const [err, setErr] = useState('');
+  const [busy, setBusy] = useState(false);
+  const [done, setDone] = useState(false);
+
+  const submit = async (e) => {
+    e.preventDefault();
+    setErr('');
+    if (next.length < 8) return setErr('Naya password kam se kam 8 characters ka ho.');
+    if (next !== confirmPw) return setErr('Dono naye password match nahi kar rahe.');
+    if (hasPassword && next === current) return setErr('Naya password purane se alag hona chahiye.');
+    setBusy(true);
+    try {
+      await api('/api/auth/change-password', { method: 'POST', body: JSON.stringify({ current, next }) });
+      setDone(true);
+      onDone();
+    } catch (e2) {
+      setErr(e2.message);
+    }
+    setBusy(false);
+  };
+
+  const type = show ? 'text' : 'password';
+
+  return (
+    <div className="modal-bg" onClick={onClose}>
+      <form className="card modal" onClick={(e) => e.stopPropagation()} onSubmit={submit}>
+        <button type="button" className="icon close" onClick={onClose} title="Band karein">
+          ✕
+        </button>
+        <h2>{hasPassword ? 'Password badlein' : 'Password lagayein'}</h2>
+
+        {done ? (
+          <>
+            <div className="success">
+              <div className="success-icon">✓</div>
+              <div>
+                <div className="success-title">Password badal gaya!</div>
+                <div className="success-sub">Agli baar naye password se login karein. Doosre devices log out ho gaye hain.</div>
+              </div>
+            </div>
+            <button type="button" className="primary" onClick={onClose}>
+              Theek hai
+            </button>
+          </>
+        ) : (
+          <>
+            {hasPassword && (
+              <>
+                <label className="field-label">Purana password</label>
+                <input
+                  className="text-input"
+                  type={type}
+                  value={current}
+                  onChange={(e) => setCurrent(e.target.value)}
+                  autoComplete="current-password"
+                  autoFocus
+                />
+              </>
+            )}
+            <label className="field-label">Naya password</label>
+            <input
+              className="text-input"
+              type={type}
+              value={next}
+              onChange={(e) => setNext(e.target.value)}
+              autoComplete="new-password"
+              placeholder="Kam se kam 8 characters"
+              autoFocus={!hasPassword}
+            />
+            <label className="field-label">Naya password dobara</label>
+            <input
+              className="text-input"
+              type={type}
+              value={confirmPw}
+              onChange={(e) => setConfirmPw(e.target.value)}
+              autoComplete="new-password"
+            />
+            <label className="check">
+              <input type="checkbox" checked={show} onChange={(e) => setShow(e.target.checked)} />
+              Password dikhayein
+            </label>
+            {err && <div className="error">{err}</div>}
+            <button className="primary" disabled={busy || !next || !confirmPw || (hasPassword && !current)}>
+              {busy ? 'Saving…' : 'Password save karein'}
+            </button>
+          </>
+        )}
+      </form>
+    </div>
+  );
+}
+
+// the official WhatsApp number in the sidebar
+function SenderCard({ wa }) {
+  const s = wa.sender;
+  const state = wa.serverDown ? 'disconnected' : s?.status === 'connected' ? 'connected' : s ? 'disconnected' : 'connecting';
+  const title = wa.serverDown
+    ? 'Server offline'
+    : !s
+      ? 'Loading…'
+      : s.status === 'connected'
+        ? 'Official API'
+        : s.status === 'not-configured'
+          ? 'API set nahi hai'
+          : 'Meta API error';
+  return (
+    <div className="accounts">
+      <div className="acc-heading">WhatsApp Number</div>
+      <div className="acc active">
+        <div className={`dot ${state}`} />
+        <div className="acc-info">
+          <div className="acc-title">{title}</div>
+          {s?.status === 'connected' && (
+            <div className="acc-sub">
+              +{s.phone}
+              {s.quality && ` · ${s.quality}`}
+            </div>
+          )}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function SenderProblem({ wa }) {
   if (wa.serverDown)
     return (
       <section className="card connect">
         <p className="error">Backend server nahi chal raha. Terminal me `npm run dev` chalayein.</p>
       </section>
     );
-  if (!account)
+  if (!wa.sender)
     return (
       <section className="card connect">
         <p className="hint">Loading…</p>
       </section>
     );
-
   return (
     <section className="card connect">
-      <h2>Account {account.id} — WhatsApp connect karein</h2>
-      {account.status === 'idle' ? (
-        <>
-          <p className="hint">Is account me abhi koi WhatsApp login nahi hai.</p>
-          <button className="primary" onClick={() => onLogin(account.id)}>
-            QR code se login karein
-          </button>
-        </>
-      ) : account.qr ? (
-        <>
-          <img src={account.qr} alt="WhatsApp QR" className="qr" />
-          <ol>
-            <li>Phone me WhatsApp kholein</li>
-            <li>
-              <b>Settings → Linked Devices → Link a device</b> par jayein
-            </li>
-            <li>Is QR code ko scan karein</li>
-          </ol>
-          <p className="hint">
-            Jis number se scan karenge, usi number se messages jayenge aur aapke WhatsApp chats me bhi dikhenge.
-          </p>
-        </>
-      ) : account.status === 'disconnected' ? (
-        <p className="hint">Connection toot gaya, dobara connect ho raha hai…</p>
-      ) : (
-        <p className="hint">QR code load ho raha hai…</p>
-      )}
+      <h2>{wa.sender.status === 'not-configured' ? 'Official API set nahi hai' : 'Official API connect nahi hua'}</h2>
+      {wa.sender.error && <p className="error">{wa.sender.error}</p>}
+      <p className="hint">
+        Server ki .env me WA_CLOUD_TOKEN, WA_PHONE_NUMBER_ID aur WA_BUSINESS_ACCOUNT_ID check karein. Token expire ho gaya
+        ho to naya permanent (System User) token banayein.
+      </p>
     </section>
   );
 }
 
-function Templates({ templates, reload, onUse }) {
-  const [form, setForm] = useState(null);
-  const [busy, setBusy] = useState(false);
+function CustomComposer({ text, setText, image, setImage, pickImage, uploading, sending }) {
+  return (
+    <div className="cloud">
+      <h2>Custom message</h2>
+      <div className="notice warn">
+        WhatsApp ka niyam: custom message sirf unhe jaata hai jinhone <b>pichhle 24 ghante me aapko message kiya</b> ho
+        (jaise YES reply wale). Naye logon ke liye approved template hi chahiye — aise numbers apne aap skip honge.
+      </div>
+      <textarea
+        className="message"
+        rows={7}
+        value={text}
+        onChange={(e) => setText(e.target.value)}
+        placeholder="Apna message likhein…"
+        disabled={sending}
+      />
+      <div className="attach-row">
+        {image ? (
+          <div className="attach-preview">
+            <img src={imgUrl(image)} alt="poster" />
+            <div>
+              <div className="attach-title">Image / poster lagi hai</div>
+              <div className="hint">Message iska caption banega</div>
+            </div>
+            <button className="icon" onClick={() => setImage(null)} disabled={sending} title="Image hatao">
+              ✕
+            </button>
+          </div>
+        ) : (
+          <button className="ghost" onClick={pickImage} disabled={sending || uploading}>
+            {uploading ? 'Upload ho raha hai…' : '🖼 Image / poster lagayein (JPG/PNG)'}
+          </button>
+        )}
+      </div>
+      <div className="hint right">
+        {text.length}/{image ? 1024 : 4096} characters
+      </div>
+    </div>
+  );
+}
+
+function Composer({ state, reload, tpl, templateKey, setTemplateKey, params, setParams, image, setImage, pickImage, uploading, sending }) {
+  const preview = tpl ? tpl.body.replace(/\{\{(\d+)\}\}/g, (m, i) => params[i - 1]?.trim() || m) : '';
+  return (
+    <div className="cloud">
+      <div className="card-head">
+        <h2>Approved template</h2>
+        <button className="link-btn plain" onClick={reload} disabled={state.loading}>
+          {state.loading ? 'Loading…' : '↻ Refresh'}
+        </button>
+      </div>
+      <p className="hint">
+        Naye logon ko sirf Meta se approve hue template hi bhej sakte hain. Template WhatsApp Manager me banayein, approve
+        hone ke baad yaha dikhega.
+      </p>
+      {state.error && <div className="error">{state.error}</div>}
+      {!state.loading && !state.error && !state.list.length && (
+        <div className="notice warn">
+          Abhi koi approved template nahi hai.{' '}
+          <a href="https://business.facebook.com/wa/manage/message-templates/" target="_blank" rel="noreferrer">
+            Template banayein →
+          </a>
+        </div>
+      )}
+      {state.list.length > 0 && (
+        <select className="text-input" value={templateKey} onChange={(e) => setTemplateKey(e.target.value)} disabled={sending}>
+          <option value="">— Template chunein —</option>
+          {state.list.map((t) => (
+            <option key={`${t.name}|${t.language}`} value={`${t.name}|${t.language}`}>
+              {t.name} ({t.language}) · {t.category}
+            </option>
+          ))}
+        </select>
+      )}
+
+      {tpl && (
+        <>
+          {Array.from({ length: tpl.vars }, (_, i) => (
+            <div key={i}>
+              <label className="field-label">{`{{${i + 1}}}`} ki value</label>
+              <input
+                className="text-input"
+                value={params[i] || ''}
+                onChange={(e) => setParams((p) => Object.assign([...p], { [i]: e.target.value }))}
+                disabled={sending}
+              />
+            </div>
+          ))}
+
+          {tpl.headerFormat === 'IMAGE' && (
+            <div className="attach-row">
+              {image ? (
+                <div className="attach-preview">
+                  <img src={imgUrl(image)} alt="poster" />
+                  <div className="attach-title">Header image</div>
+                  <button className="icon" onClick={() => setImage(null)} disabled={sending} title="Image hatao">
+                    ✕
+                  </button>
+                </div>
+              ) : (
+                <button className="ghost" onClick={pickImage} disabled={sending || uploading}>
+                  {uploading ? 'Upload ho raha hai…' : '🖼 Template ki header image lagayein (JPG/PNG)'}
+                </button>
+              )}
+            </div>
+          )}
+
+          <div className="wa-preview">
+            {tpl.headerFormat === 'IMAGE' && image && <img src={imgUrl(image)} alt="" />}
+            {tpl.headerText && <b>{tpl.headerText}</b>}
+            <p>{preview}</p>
+            {tpl.footer && <small>{tpl.footer}</small>}
+            {tpl.buttons.length > 0 && (
+              <div className="wa-buttons">
+                {tpl.buttons.map((b) => (
+                  <span key={b}>{b}</span>
+                ))}
+              </div>
+            )}
+          </div>
+        </>
+      )}
+    </div>
+  );
+}
+
+function Safety({ wa, optouts, reloadOptouts, onSaved }) {
+  const [limit, setLimit] = useState(() => wa.limit ?? '');
+  const [saved, setSaved] = useState('');
   const [err, setErr] = useState('');
-  const fileRef = useRef(null);
+  const [text, setText] = useState('');
 
-  const open = (t) => {
+  const saveLimit = async () => {
     setErr('');
-    setForm(t ? { ...t } : { id: null, name: `Message ${templates.length + 1}`, text: '', image: null });
-  };
-
-  const pick = async (e) => {
-    const file = e.target.files?.[0];
-    e.target.value = '';
-    if (!file) return;
-    setBusy(true);
+    setSaved('');
     try {
-      const name = await uploadImage(file);
-      setForm((f) => ({ ...f, image: name }));
-    } catch (e2) {
-      setErr(e2.message);
+      await api('/api/settings/limits', { method: 'PUT', body: JSON.stringify({ cloud: limit }) });
+      setSaved('Limit save ho gayi ✓');
+      onSaved();
+    } catch (e) {
+      setErr(e.message);
     }
-    setBusy(false);
   };
 
-  const save = async () => {
-    setBusy(true);
+  const addNumbers = async () => {
     setErr('');
     try {
-      const body = JSON.stringify({ name: form.name, text: form.text, image: form.image });
-      if (form.id) await api(`/api/templates/${form.id}`, { method: 'PUT', body });
-      else await api('/api/templates', { method: 'POST', body });
-      setForm(null);
-      reload();
-    } catch (e2) {
-      setErr(e2.message);
+      await api('/api/optouts', { method: 'POST', body: JSON.stringify({ numbers: extractTokens(text) }) });
+      setText('');
+      reloadOptouts();
+    } catch (e) {
+      setErr(e.message);
     }
-    setBusy(false);
   };
 
-  const remove = async (t) => {
-    if (!confirm(`"${t.name}" delete karna hai?`)) return;
-    await api(`/api/templates/${t.id}`, { method: 'DELETE' }).catch(() => {});
-    reload();
+  const remove = async (n) => {
+    if (!confirm(`+${n} ko opt-out list se hatana hai? Iske baad is number par message ja sakega.`)) return;
+    await api(`/api/optouts/${n}`, { method: 'DELETE' }).catch(() => {});
+    reloadOptouts();
   };
 
   return (
     <div className="templates">
-      <div className="card-head tpl-top">
-        <div>
-          <h2>Saved Messages</h2>
-          <p className="hint">Message 1, 2, 3… save karein — text ke saath image/poster bhi. Send page par ek click me lagayein.</p>
+      <section className="card">
+        <h2>Roz ki limit</h2>
+        <p className="hint">
+          Ek din (India time) me itne logon tak hi message jayega. Meta ki apni limit abhi{' '}
+          {wa.sender?.tier ? wa.sender.tier.replace('TIER_', '') : '250'} log / 24 ghante hai — usse zyada rakhne ka fayda
+          nahi.
+        </p>
+        <div className="limits">
+          <label className="limit-row">
+            <span>
+              <b>Official API</b>
+              <span className="hint"> · aaj {wa.usedToday || 0} bheje</span>
+            </span>
+            <input className="text-input" type="number" min="0" value={limit} onChange={(e) => setLimit(e.target.value)} />
+          </label>
         </div>
-        {!form && (
-          <button className="primary" onClick={() => open(null)}>
-            + Naya message
+        {err && <div className="error">{err}</div>}
+        <div className="tpl-actions">
+          {saved && <span className="hint">{saved}</span>}
+          <button className="primary small" onClick={saveLimit}>
+            Save
           </button>
-        )}
-      </div>
+        </div>
+      </section>
 
-      {form && (
-        <section className="card tpl-form">
-          <h3>{form.id ? 'Message edit karein' : 'Naya message save karein'}</h3>
-          <label className="field-label">Naam</label>
-          <input className="text-input" value={form.name} onChange={(e) => setForm({ ...form, name: e.target.value })} />
-          <label className="field-label">Message</label>
+      <section className="card">
+        <div className="card-head">
+          <h2>Opt-out (Do Not Disturb) list</h2>
+          <span className="count">{optouts.length}</span>
+        </div>
+        <p className="hint">
+          Jo log "STOP" likh kar reply karte hain ya "Stop promotions" button dabate hain, wo apne aap yaha aa jaate hain.
+          In numbers par kabhi message nahi jayega. Kisi ne call/chat par mana kiya ho to number yaha khud bhi daal sakti
+          hain.
+        </p>
+        <div className="optout-add">
           <textarea
-            className="message"
-            rows={6}
-            value={form.text}
-            onChange={(e) => setForm({ ...form, text: e.target.value })}
-            placeholder="Message likhein… (image ke saath ye caption banega)"
+            className="paste"
+            rows={2}
+            value={text}
+            onChange={(e) => setText(e.target.value)}
+            placeholder="9876543210, 9123456789 …"
           />
-          <div className="attach-row">
-            {form.image ? (
-              <div className="attach-preview">
-                <img src={imgUrl(form.image)} alt="poster" />
-                <div className="attach-title">Image / poster</div>
-                <button className="icon" onClick={() => setForm({ ...form, image: null })} title="Image hatao">
-                  ✕
+          <button className="ghost" onClick={addNumbers} disabled={!text.trim()}>
+            ⛔ List me daalein
+          </button>
+        </div>
+        {optouts.length > 0 && (
+          <ul className="results">
+            {optouts.map((o) => (
+              <li key={o.number}>
+                <span>
+                  +{o.number}
+                  <span className="hint">
+                    {' '}
+                    · {o.source === 'manual' ? 'manual' : `"${o.note}"`} · {fmtDate(o.createdAt)}
+                  </span>
+                </span>
+                <button className="link-btn" onClick={() => remove(o.number)}>
+                  Hatao
                 </button>
+              </li>
+            ))}
+          </ul>
+        )}
+      </section>
+    </div>
+  );
+}
+
+function Inbox() {
+  const [list, setList] = useState(null);
+  const [filter, setFilter] = useState('all');
+  const [open, setOpen] = useState(null); // selected number
+  const [thread, setThread] = useState(null);
+  const [text, setText] = useState('');
+  const [err, setErr] = useState('');
+  const [busy, setBusy] = useState(false);
+  const [perm, setPerm] = useState(() => ('Notification' in window ? Notification.permission : 'unsupported'));
+  const endRef = useRef(null);
+
+  const loadList = () => api('/api/inbox').then(setList).catch(() => {});
+  const loadThread = (n) => api(`/api/inbox/${n}`).then(setThread).catch(() => {});
+
+  useEffect(() => {
+    loadList();
+    const id = setInterval(loadList, 5000);
+    return () => clearInterval(id);
+  }, []);
+
+  useEffect(() => {
+    setErr('');
+    if (!open) return setThread(null);
+    loadThread(open);
+    const id = setInterval(() => loadThread(open), 4000);
+    return () => clearInterval(id);
+  }, [open]);
+
+  useEffect(() => {
+    endRef.current?.scrollIntoView({ block: 'end' });
+  }, [thread?.messages?.length]);
+
+  const send = async (e) => {
+    e.preventDefault();
+    if (!text.trim()) return;
+    setBusy(true);
+    setErr('');
+    try {
+      await api(`/api/inbox/${open}/reply`, { method: 'POST', body: JSON.stringify({ text }) });
+      setText('');
+      await loadThread(open);
+      loadList();
+    } catch (e2) {
+      setErr(e2.message);
+    }
+    setBusy(false);
+  };
+
+  const askNotify = async () => setPerm(await Notification.requestPermission());
+
+  const shown = (list || []).filter((c) =>
+    filter === 'yes' ? c.interested : filter === 'unread' ? c.unread > 0 : filter === 'stop' ? c.stop : true
+  );
+  const counts = {
+    yes: (list || []).filter((c) => c.interested).length,
+    unread: (list || []).filter((c) => c.unread > 0).length,
+    stop: (list || []).filter((c) => c.stop).length,
+  };
+
+  return (
+    <div className={`inbox ${open ? 'has-thread' : ''}`}>
+      <section className="card inbox-list">
+        <div className="card-head">
+          <h2>Inbox</h2>
+          {perm === 'default' && (
+            <button className="link-btn plain" onClick={askNotify}>
+              🔔 Notification chalu karein
+            </button>
+          )}
+        </div>
+        <p className="hint">Customers ke reply yaha aate hain. YES/haan wale ⭐ ke saath dikhte hain.</p>
+        <div className="filters">
+          {[
+            ['all', 'Sab'],
+            ['yes', `⭐ YES (${counts.yes})`],
+            ['unread', `Unread (${counts.unread})`],
+            ['stop', `STOP (${counts.stop})`],
+          ].map(([k, label]) => (
+            <button key={k} className={`chip ${filter === k ? 'on' : ''}`} onClick={() => setFilter(k)}>
+              {label}
+            </button>
+          ))}
+        </div>
+        {list === null ? (
+          <p className="hint">Loading…</p>
+        ) : !shown.length ? (
+          <p className="hint">Abhi koi reply nahi hai.</p>
+        ) : (
+          <ul className="convs">
+            {shown.map((c) => (
+              <li
+                key={c.number}
+                className={`${open === c.number ? 'on' : ''} ${c.unread ? 'unread' : ''}`}
+                onClick={() => setOpen(c.number)}
+              >
+                <div className="conv-top">
+                  <b>
+                    {c.interested && '⭐ '}
+                    {c.name || `+${c.number}`}
+                  </b>
+                  <span className="hint">{fmtDate(c.lastTime)}</span>
+                </div>
+                <div className="conv-bottom">
+                  <span className="conv-text">
+                    {c.lastDirection === 'out' && '↪ '}
+                    {c.lastText}
+                  </span>
+                  {c.stop && <span className="pill failed">STOP</span>}
+                  {c.unread > 0 && <span className="badge">{c.unread}</span>}
+                </div>
+                {c.name && <div className="hint conv-num">+{c.number}</div>}
+              </li>
+            ))}
+          </ul>
+        )}
+      </section>
+
+      {open && (
+        <section className="card thread">
+          <div className="thread-head">
+            <button className="icon back" onClick={() => setOpen(null)} title="Wapas">
+              ←
+            </button>
+            <div className="thread-who">
+              <b>{thread?.name || `+${open}`}</b>
+              {(thread?.name || thread?.optedOut) && (
+                <div className="hint">
+                  {thread?.name && `+${open}`}
+                  {thread?.optedOut && `${thread?.name ? ' · ' : ''}⛔ opt-out (STOP)`}
+                </div>
+              )}
+            </div>
+            <a className="link-btn plain" href={`tel:+${open}`}>
+              📞 Call
+            </a>
+          </div>
+
+          <div className="bubbles">
+            {(thread?.messages || []).map((m) => (
+              <div key={m.id} className={`bubble ${m.direction} ${m.interested ? 'yes' : ''}`}>
+                {m.image && <img src={imgUrl(m.image)} alt="" />}
+                <div className="bubble-text">{m.text}</div>
+                <div className="bubble-meta">
+                  {m.template && 'template · '}
+                  {fmtDate(m.time)}
+                  {m.direction === 'out' && m.delivery && ` · ${DELIVERY_LABEL[m.delivery] || m.delivery}`}
+                </div>
               </div>
-            ) : (
-              <button className="ghost" onClick={() => fileRef.current?.click()} disabled={busy}>
-                {busy ? 'Upload ho raha hai…' : '🖼 Image / poster lagayein'}
-              </button>
-            )}
-            <input ref={fileRef} type="file" accept="image/*" hidden onChange={pick} />
+            ))}
+            <div ref={endRef} />
           </div>
+
+          {thread && !thread.canReply ? (
+            <div className="notice warn">
+              Customer ke aakhri message ko 24 ghante ho gaye — WhatsApp ke niyam se ab sirf approved template bhej sakte
+              hain. Unhe call kar sakti hain.
+            </div>
+          ) : (
+            <form className="reply-box" onSubmit={send}>
+              <textarea
+                rows={2}
+                value={text}
+                onChange={(e) => setText(e.target.value)}
+                placeholder="Jawab likhein…"
+                disabled={busy || thread?.optedOut}
+                onKeyDown={(e) => {
+                  if (e.key === 'Enter' && !e.shiftKey) send(e);
+                }}
+              />
+              <button className="primary" disabled={busy || !text.trim() || thread?.optedOut}>
+                {busy ? '…' : 'Send'}
+              </button>
+            </form>
+          )}
+          {thread?.canReply && thread.windowEndsAt && (
+            <div className="hint">Jawab de sakti hain {fmtDate(thread.windowEndsAt)} tak.</div>
+          )}
           {err && <div className="error">{err}</div>}
-          <div className="tpl-actions">
-            <button className="ghost" onClick={() => setForm(null)} disabled={busy}>
-              Cancel
-            </button>
-            <button className="primary" onClick={save} disabled={busy}>
-              Save
-            </button>
-          </div>
         </section>
       )}
-
-      {!templates.length && !form && (
-        <section className="card">
-          <p className="hint">Abhi koi message saved nahi hai. "+ Naya message" dabakar banayein.</p>
-        </section>
-      )}
-
-      <div className="tpl-grid">
-        {templates.map((t, i) => (
-          <section className="card tpl-card" key={t.id}>
-            <div className="tpl-name">
-              <span className="tpl-no">{i + 1}</span>
-              {t.name}
-            </div>
-            {t.image && <img className="tpl-img" src={imgUrl(t.image)} alt="poster" />}
-            {t.text && <p className="tpl-text">{t.text}</p>}
-            <div className="tpl-actions">
-              <button className="link-btn plain" onClick={() => open(t)}>
-                Edit
-              </button>
-              <button className="link-btn" onClick={() => remove(t)}>
-                Delete
-              </button>
-              <button className="primary small" onClick={() => onUse(t)}>
-                Use karein →
-              </button>
-            </div>
-          </section>
-        ))}
-      </div>
     </div>
   );
 }
@@ -847,6 +1275,7 @@ function History({ history }) {
               <span className="hint">
                 {fmtDate(job.createdAt)}
                 {job.from && ` · from +${job.from}`}
+                {job.template && ` · ${job.template.name}`}
               </span>
               <span className="count">
                 {sent}/{job.results.length} sent
@@ -860,8 +1289,8 @@ function History({ history }) {
               {job.results.map((r) => (
                 <li key={r.number}>
                   <span>+{r.number}</span>
-                  <span className={`pill ${r.status}`}>
-                    {STATUS_LABEL[r.status]}
+                  <span className={`pill ${r.delivery === 'failed' ? 'failed' : r.status}`}>
+                    {(r.delivery && DELIVERY_LABEL[r.delivery]) || STATUS_LABEL[r.status]}
                     {r.error ? ` – ${r.error}` : ''}
                   </span>
                 </li>
