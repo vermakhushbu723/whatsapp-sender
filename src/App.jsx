@@ -1,27 +1,66 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
+import { api } from './api.js';
+import Planner from './Planner.jsx';
+import Content from './Content.jsx';
+
+const ICONS = {
+  send: 'M22 2 11 13M22 2l-7 20-4-9-9-4 20-7z',
+  inbox: 'M22 12h-6l-2 3h-4l-2-3H2M5.45 5.11 2 12v6a2 2 0 0 0 2 2h16a2 2 0 0 0 2-2v-6l-3.45-6.89A2 2 0 0 0 16.76 4H7.24a2 2 0 0 0-1.79 1.11z',
+  planner: 'M8 2v4M16 2v4M3 10h18M5 4h14a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V6a2 2 0 0 1 2-2zM9 16l2 2 4-4',
+  history: 'M3 12a9 9 0 1 0 3-6.7L3 8M3 3v5h5M12 7v5l3 2',
+  safety: 'M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z',
+  key: 'M21 2l-2 2m-7.6 7.6a5.5 5.5 0 1 1-7.78 7.78 5.5 5.5 0 0 1 7.78-7.78zm0 0L15.5 7.5m0 0 3 3L22 7l-3-3m-3.5 3.5L19 4',
+  logout: 'M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4M16 17l5-5-5-5M21 12H9',
+  menu: 'M3 6h18M3 12h18M3 18h18',
+  bell: 'M18 8A6 6 0 0 0 6 8c0 7-3 9-3 9h18s-3-2-3-9M13.73 21a2 2 0 0 1-3.46 0',
+  candle: 'M12 2c1.5 2 2 3 2 4a2 2 0 0 1-4 0c0-1 .5-2 2-4zM9 10h6v12H9zM6 22h12',
+  post: 'M4 4h16v16H4zM4 15l4-4 4 4 3-3 5 5M15 8.5h.01',
+};
+
+function Icon({ name, size = 20 }) {
+  return (
+    <svg className="ic" width={size} height={size} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+      <path d={ICONS[name]} />
+    </svg>
+  );
+}
+
+const NAV = [
+  { id: 'send', label: 'Send Message', short: 'Send', sub: 'Template ya custom message bhejein' },
+  { id: 'inbox', label: 'Inbox', short: 'Inbox', sub: 'Replies aur Sent / Read status' },
+  { id: 'tasks-achivora', parent: 'tasks', label: 'Achivora Tasks', sub: 'Achivora: hafte ke marketing kaam — social media, SEO, WhatsApp, ads' },
+  { id: 'tasks-jyotessa', parent: 'tasks', label: 'Jyotessa Tasks', sub: 'Jyotessa: hafte ke marketing kaam — social media, SEO, WhatsApp, ads' },
+  { id: 'posts-achivora', parent: 'posts', label: 'Achivora Posts', sub: 'Achivora: har din kya post karna hai — topic, hook, caption, hashtags' },
+  { id: 'posts-jyotessa', parent: 'posts', label: 'Jyotessa Posts', sub: 'Jyotessa: har din kya post karna hai — topic, hook, caption, hashtags' },
+  { id: 'history', label: 'History', short: 'History', sub: 'Pichhle bheje gaye campaigns' },
+  { id: 'safety', label: 'Limits & Opt-out', short: 'Limits', sub: 'Roz ki limit aur STOP list', mobile: false },
+];
+
+// parent menus in the sidebar; each opens to show its Achivora / Jyotessa pages
+const GROUPS = {
+  tasks: { label: 'Marketing Tasks', short: 'Tasks', icon: 'planner' },
+  posts: { label: 'Social Media', short: 'Posts', icon: 'post' },
+};
+
+// sidebar / bottom-bar order: plain pages and parent menus
+const MENU = ['send', 'inbox', 'group:tasks', 'group:posts', 'history', 'safety'];
+
+// links saved before the menus were grouped
+const OLD_HASH = { planner: 'tasks-achivora', achivora: 'tasks-achivora', jyotessa: 'tasks-jyotessa' };
 
 const DEFAULT_COUNTRY_CODE = '91';
 
 const STATUS_LABEL = {
   pending: 'Waiting',
   sending: 'Sending…',
-  sent: 'Sent ✓',
+  sent: 'Sent ',
   failed: 'Failed',
   skipped: 'Skipped (STOP)',
 };
 
 // delivery receipts from the official API webhook
-const DELIVERY_LABEL = { sent: 'Sent ✓', delivered: 'Delivered ✓✓', read: 'Read ✓✓', failed: 'Failed' };
+const DELIVERY_LABEL = { sent: 'Sent ', delivered: 'Delivered ', read: 'Read ', failed: 'Failed' };
 
-async function api(url, options) {
-  const res = await fetch(url, {
-    headers: { 'Content-Type': 'application/json' },
-    ...options,
-  });
-  const data = await res.json().catch(() => ({}));
-  if (!res.ok) throw Object.assign(new Error(data.error || 'Server error'), { status: res.status });
-  return data;
-}
 
 // same rules as server/index.js normalizeNumber
 function normalize(raw) {
@@ -81,13 +120,25 @@ export default function App() {
   const [notice, setNotice] = useState(null);
   const [history, setHistory] = useState([]);
   const [resend, setResend] = useState(false);
-  const [tab, setTab] = useState('send');
+  // the open page lives in the URL hash (#planner …) so it survives reloads and can be bookmarked
+  const [tab, setTabState] = useState(() => {
+    const raw = window.location.hash.slice(1);
+    const h = OLD_HASH[raw] || raw;
+    return NAV.some((n) => n.id === h) ? h : 'send';
+  });
+  const setTab = (id) => {
+    setTabState(id);
+    if (window.location.hash !== `#${id}`) window.history.replaceState(null, '', `#${id}`);
+  };
   const [dismissedJob, setDismissedJob] = useState(null);
   const [showPassword, setShowPassword] = useState(false);
+  const [drawer, setDrawer] = useState(false);
+  const [openGroups, setOpenGroups] = useState({});
   const [image, setImage] = useState(null);
   const [uploading, setUploading] = useState(false);
   const [optouts, setOptouts] = useState([]);
-  const [templates, setTemplates] = useState({ list: [], error: '', loading: false });
+  // starts as loading so the "no template -> custom" switch waits for the real list
+  const [templates, setTemplates] = useState({ list: [], error: '', loading: true });
   const [templateKey, setTemplateKey] = useState('');
   const [params, setParams] = useState([]);
   const [mode, setMode] = useState('template'); // template | custom
@@ -344,7 +395,7 @@ export default function App() {
 
   let sendLabel = `Send to ${sendable.length} number${sendable.length === 1 ? '' : 's'}`;
   if (sending) sendLabel = 'Sending…';
-  else if (!sendable.length && sentBeforeCount) sendLabel = 'Sent ✓ — naya number dalein';
+  else if (!sendable.length && sentBeforeCount) sendLabel = 'Bhej diya — naya number dalein';
 
   if (wa.needLogin) return <LoginScreen />;
 
@@ -353,38 +404,77 @@ export default function App() {
     window.location.reload();
   };
 
+  const page = NAV.find((n) => n.id === tab) || NAV[0];
+  // remembered so the bottom bar's Tasks / Posts open the brand used last
+  const brandNow = tab.endsWith('-jyotessa') ? 'jyotessa' : 'achivora';
+  const go = (id) => {
+    setTab(id);
+    setDrawer(false);
+  };
+
   return (
-    <div className="layout">
-      <aside className="sidebar">
+    <div className="app">
+      <aside className={`sidebar ${drawer ? 'open' : ''}`}>
         <div className="brand">
-          <span className="logo">✆</span> WA Sender
+          <img className="brand-mark" src="/logo-mark.png" alt="WA Sender" />
+          <div>
+            <div className="brand-name">
+              <span className="wa">WA</span> <span className="snd">Sender</span>
+            </div>
+            <div className="brand-sub">Achivora</div>
+          </div>
         </div>
-        <nav>
-          <button className={tab === 'send' ? 'active' : ''} onClick={() => setTab('send')}>
-            Send Message
-          </button>
-          <button className={tab === 'inbox' ? 'active' : ''} onClick={() => setTab('inbox')}>
-            Inbox {wa.unread > 0 && <span className="badge">{wa.unread}</span>}
-          </button>
-          <button className={tab === 'history' ? 'active' : ''} onClick={() => setTab('history')}>
-            History
-          </button>
-          <button className={tab === 'safety' ? 'active' : ''} onClick={() => setTab('safety')}>
-            Limits & Opt-out
-          </button>
+        <nav className="side-nav">
+          {MENU.map((key) => {
+            if (!key.startsWith('group:')) {
+              const n = NAV.find((x) => x.id === key);
+              return (
+                <button key={key} className={tab === n.id ? 'active' : ''} onClick={() => go(n.id)}>
+                  <Icon name={n.icon || n.id} />
+                  <span>{n.label}</span>
+                  {n.id === 'inbox' && wa.unread > 0 && <span className="badge">{wa.unread}</span>}
+                </button>
+              );
+            }
+            const g = key.slice(6);
+            const kids = NAV.filter((x) => x.parent === g);
+            const inside = kids.some((x) => x.id === tab);
+            const open = openGroups[g] ?? inside; // the menu of the open page starts open
+            return (
+              <div key={key} className={`nav-parent ${inside ? 'inside' : ''}`}>
+                <button className="nav-parent-btn" onClick={() => setOpenGroups((o) => ({ ...o, [g]: !open }))} aria-expanded={open}>
+                  <Icon name={GROUPS[g].icon} />
+                  <span>{GROUPS[g].label}</span>
+                  <svg className={`chev ${open ? 'open' : ''}`} width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+                    <path d="M6 9l6 6 6-6" />
+                  </svg>
+                </button>
+                {open && (
+                  <div className="nav-children">
+                    {kids.map((x) => (
+                      <button key={x.id} className={tab === x.id ? 'active' : ''} onClick={() => go(x.id)}>
+                        {x.label}
+                      </button>
+                    ))}
+                  </div>
+                )}
+              </div>
+            );
+          })}
         </nav>
         <SenderCard wa={wa} />
         <div className="side-actions">
-          <button className="signout" onClick={() => setShowPassword(true)}>
-            🔑 {wa.authEnabled ? 'Password badlein' : 'Password lagayein'}
+          <button className="signout" onClick={() => { setShowPassword(true); setDrawer(false); }}>
+            <Icon name="key" size={16} /> {wa.authEnabled ? 'Password badlein' : 'Password lagayein'}
           </button>
           {wa.authEnabled && (
             <button className="signout" onClick={signOut}>
-              ⎋ Sign out
+              <Icon name="logout" size={16} /> Sign out
             </button>
           )}
         </div>
       </aside>
+      {drawer && <div className="drawer-bg" onClick={() => setDrawer(false)} />}
 
       {showPassword && (
         <ChangePassword
@@ -394,8 +484,38 @@ export default function App() {
         />
       )}
 
-      <main className="content">
-        {tab === 'inbox' ? (
+      <div className="main">
+        <header className="topbar">
+          <button className="icon-btn menu-btn" onClick={() => setDrawer(true)} aria-label="Menu">
+            <Icon name="menu" />
+          </button>
+          <img className="top-mark" src="/logo-mark.png" alt="" />
+          <div className="topbar-title">
+            <h1>{page.label}</h1>
+            <p>{page.sub}</p>
+          </div>
+          <div className="topbar-right">
+            {wa.limit !== undefined && (
+              <span className={`top-chip ${wa.usedToday >= wa.limit ? 'full' : ''}`} title="Aaj bheje gaye template messages">
+                Aaj {wa.usedToday}/{wa.limit}
+              </span>
+            )}
+            <span className={`top-chip status ${wa.sender?.status === 'connected' ? 'ok' : 'bad'}`}>
+              <i className="dot-sm" /> <span className="hide-sm">{wa.sender?.status === 'connected' ? 'API Connected' : 'Offline'}</span>
+            </span>
+            <button className="icon-btn bell" onClick={() => go('inbox')} aria-label="Inbox">
+              <Icon name="bell" />
+              {wa.unread > 0 && <span className="badge dot-badge">{wa.unread}</span>}
+            </button>
+          </div>
+        </header>
+
+      <main className={`content ${tab === 'inbox' ? 'content-inbox' : ''}`}>
+        {tab.startsWith('tasks-') ? (
+          <Planner key={tab} brand={tab.slice(6)} onBrand={(b) => go(`tasks-${b}`)} />
+        ) : tab.startsWith('posts-') ? (
+          <Content key={tab} brand={tab.slice(6)} onBrand={(b) => go(`posts-${b}`)} />
+        ) : tab === 'inbox' ? (
           <Inbox />
         ) : tab === 'history' ? (
           <History history={history} />
@@ -449,11 +569,11 @@ export default function App() {
 
               {(invalidCount > 0 || dupCount > 0 || sentBeforeCount > 0 || blockedCount > 0 || closedCount > 0) && (
                 <div className="summary">
-                  {invalidCount > 0 && <span className="pill failed">⚠ {invalidCount} galat</span>}
-                  {blockedCount > 0 && <span className="pill failed">⛔ {blockedCount} opt-out</span>}
-                  {dupCount > 0 && <span className="pill dup">⧉ {dupCount} duplicate</span>}
-                  {sentBeforeCount > 0 && <span className="pill sent">✓ {sentBeforeCount} pehle bhej chuke</span>}
-                  {closedCount > 0 && <span className="pill sending">⏱ {closedCount} ko template chahiye</span>}
+                  {invalidCount > 0 && <span className="pill failed">{invalidCount} galat</span>}
+                  {blockedCount > 0 && <span className="pill failed">{blockedCount} opt-out</span>}
+                  {dupCount > 0 && <span className="pill dup">{dupCount} duplicate</span>}
+                  {sentBeforeCount > 0 && <span className="pill sent">{sentBeforeCount} pehle bhej chuke</span>}
+                  {closedCount > 0 && <span className="pill sending">{closedCount} ko template chahiye</span>}
                   {(invalidCount > 0 || dupCount > 0) && (
                     <button className="link-btn" onClick={removeProblemRows} disabled={sending}>
                       Galat/duplicate hatao
@@ -482,19 +602,19 @@ export default function App() {
                           ✕
                         </button>
                       </div>
-                      {r.issue && <div className="row-msg bad">⚠ {r.issue}</div>}
-                      {r.dupOf && <div className="row-msg dup">⧉ Duplicate — ye number #{r.dupOf} par already hai</div>}
+                      {r.issue && <div className="row-msg bad">{r.issue}</div>}
+                      {r.dupOf && <div className="row-msg dup">Duplicate — ye number #{r.dupOf} par already hai</div>}
                       {!r.dupOf && r.blocked && (
-                        <div className="row-msg bad">⛔ Is number ne STOP kiya hai / opt-out list me hai — message nahi jayega</div>
+                        <div className="row-msg bad">Is number ne STOP kiya hai / opt-out list me hai — message nahi jayega</div>
                       )}
                       {!r.dupOf && !r.blocked && r.sentAt && (
-                        <div className="row-msg done">✓ Is number par message ho chuka hai ({fmtDate(r.sentAt)})</div>
+                        <div className="row-msg done">Is number par message ho chuka hai ({fmtDate(r.sentAt)})</div>
                       )}
                       {isCustom && !r.empty && !r.issue && !r.dupOf && !r.blocked && (
                         r.windowEnds ? (
-                          <div className="row-msg done">💬 Custom ja sakta hai ({fmtDate(r.windowEnds)} tak)</div>
+                          <div className="row-msg done">Custom ja sakta hai ({fmtDate(r.windowEnds)} tak)</div>
                         ) : (
-                          <div className="row-msg dup">⏱ 24 ghante me reply nahi kiya — custom nahi jayega, template chahiye</div>
+                          <div className="row-msg dup">24 ghante me reply nahi kiya — custom nahi jayega, template chahiye</div>
                         )
                       )}
                     </div>
@@ -522,10 +642,10 @@ export default function App() {
               </div>
               <div className="mode-switch">
                 <button className={!isCustom ? 'on' : ''} onClick={() => setMode('template')} disabled={sending}>
-                  📋 Template
+                  Template
                 </button>
                 <button className={isCustom ? 'on' : ''} onClick={() => setMode('custom')} disabled={sending}>
-                  ✍ Custom message
+                  Custom message
                 </button>
               </div>
               {isCustom ? (
@@ -600,6 +720,25 @@ export default function App() {
           </div>
         )}
       </main>
+      </div>
+
+      <nav className="bottom-nav">
+        {MENU.filter((k) => k !== 'safety').map((key) => {
+          const g = key.startsWith('group:') ? key.slice(6) : null;
+          const n = g ? null : NAV.find((x) => x.id === key);
+          const target = g ? `${g}-${brandNow}` : n.id;
+          const active = g ? tab.startsWith(`${g}-`) : tab === n.id;
+          return (
+            <button key={key} className={active ? 'active' : ''} onClick={() => go(target)}>
+              <span className="bn-icon">
+                <Icon name={g ? GROUPS[g].icon : n.icon || n.id} size={22} />
+                {key === 'inbox' && wa.unread > 0 && <span className="badge dot-badge">{wa.unread}</span>}
+              </span>
+              <span>{g ? GROUPS[g].short : n.short}</span>
+            </button>
+          );
+        })}
+      </nav>
     </div>
   );
 }
@@ -615,7 +754,7 @@ function SuccessMessage({ job, onClose }) {
       </button>
       {sent.length > 0 ? (
         <div className="success">
-          <div className="success-icon">✓</div>
+          
           <div>
             <div className="success-title">Message successfully bhej diya gaya!</div>
             <div className="success-sub">
@@ -632,12 +771,12 @@ function SuccessMessage({ job, onClose }) {
       )}
       {skipped.length > 0 && (
         <div className="failed-list">
-          ⏭ {skipped.length} number skip hue: {skipped.map((r) => `+${r.number} (${r.error})`).join(', ')}
+          {skipped.length} number skip hue: {skipped.map((r) => `+${r.number} (${r.error})`).join(', ')}
         </div>
       )}
       {failed.length > 0 && (
         <div className="failed-list">
-          ⚠ {failed.length} number par nahi gaya:{' '}
+          {failed.length} number par nahi gaya:{' '}
           {failed.map((r) => `+${r.number}${r.error ? ` (${r.error})` : ''}`).join(', ')}
         </div>
       )}
@@ -666,8 +805,7 @@ function LoginScreen() {
   return (
     <div className="login-page">
       <form className="card login-card" onSubmit={submit}>
-        <div className="login-logo">✆</div>
-        <h2>WA Sender</h2>
+        <img className="login-logo" src="/logo-full.png" alt="WA Sender — Achivora" />
         <p className="hint">Admin panel kholne ke liye password dalein.</p>
         <input
           className="text-input"
@@ -726,7 +864,7 @@ function ChangePassword({ hasPassword, onClose, onDone }) {
         {done ? (
           <>
             <div className="success">
-              <div className="success-icon">✓</div>
+              
               <div>
                 <div className="success-title">Password badal gaya!</div>
                 <div className="success-sub">Agli baar naye password se login karein. Doosre devices log out ho gaye hain.</div>
@@ -871,7 +1009,7 @@ function CustomComposer({ text, setText, image, setImage, pickImage, uploading, 
           </div>
         ) : (
           <button className="ghost" onClick={pickImage} disabled={sending || uploading}>
-            {uploading ? 'Upload ho raha hai…' : '🖼 Image / poster lagayein (JPG/PNG)'}
+            {uploading ? 'Upload ho raha hai…' : 'Image / poster lagayein (JPG/PNG)'}
           </button>
         )}
       </div>
@@ -889,7 +1027,7 @@ function Composer({ state, reload, tpl, templateKey, setTemplateKey, params, set
       <div className="card-head">
         <h2>Approved template</h2>
         <button className="link-btn plain" onClick={reload} disabled={state.loading}>
-          {state.loading ? 'Loading…' : '↻ Refresh'}
+          {state.loading ? 'Loading…' : 'Refresh'}
         </button>
       </div>
       <p className="hint">
@@ -901,7 +1039,7 @@ function Composer({ state, reload, tpl, templateKey, setTemplateKey, params, set
         <div className="notice warn">
           Abhi koi approved template nahi hai.{' '}
           <a href="https://business.facebook.com/wa/manage/message-templates/" target="_blank" rel="noreferrer">
-            Template banayein →
+            Template banayein 
           </a>
         </div>
       )}
@@ -942,7 +1080,7 @@ function Composer({ state, reload, tpl, templateKey, setTemplateKey, params, set
                 </div>
               ) : (
                 <button className="ghost" onClick={pickImage} disabled={sending || uploading}>
-                  {uploading ? 'Upload ho raha hai…' : '🖼 Template ki header image lagayein (JPG/PNG)'}
+                  {uploading ? 'Upload ho raha hai…' : 'Template ki header image lagayein (JPG/PNG)'}
                 </button>
               )}
             </div>
@@ -969,6 +1107,10 @@ function Composer({ state, reload, tpl, templateKey, setTemplateKey, params, set
 
 function Safety({ wa, optouts, reloadOptouts, onSaved }) {
   const [limit, setLimit] = useState(() => wa.limit ?? '');
+  // page opened before /api/status answered -> fill the box once the limit arrives
+  useEffect(() => {
+    if (wa.limit !== undefined) setLimit((cur) => (cur === '' ? wa.limit : cur));
+  }, [wa.limit]);
   const [saved, setSaved] = useState('');
   const [err, setErr] = useState('');
   const [text, setText] = useState('');
@@ -978,7 +1120,7 @@ function Safety({ wa, optouts, reloadOptouts, onSaved }) {
     setSaved('');
     try {
       await api('/api/settings/limits', { method: 'PUT', body: JSON.stringify({ cloud: limit }) });
-      setSaved('Limit save ho gayi ✓');
+      setSaved('Limit save ho gayi ');
       onSaved();
     } catch (e) {
       setErr(e.message);
@@ -1048,7 +1190,7 @@ function Safety({ wa, optouts, reloadOptouts, onSaved }) {
             placeholder="9876543210, 9123456789 …"
           />
           <button className="ghost" onClick={addNumbers} disabled={!text.trim()}>
-            ⛔ List me daalein
+            List me daalein
           </button>
         </div>
         {optouts.length > 0 && (
@@ -1139,10 +1281,10 @@ function Inbox() {
       <section className="card inbox-list">
         <div className="mode-switch">
           <button className={view === 'replies' ? 'on' : ''} onClick={() => setView('replies')}>
-            💬 Replies
+            Replies
           </button>
           <button className={view === 'sent' ? 'on' : ''} onClick={() => setView('sent')}>
-            📊 Sent status
+            Sent status
           </button>
         </div>
         {view === 'sent' ? (
@@ -1153,15 +1295,15 @@ function Inbox() {
           <h2>Inbox</h2>
           {perm === 'default' && (
             <button className="link-btn plain" onClick={askNotify}>
-              🔔 Notification chalu karein
+              Notification chalu karein
             </button>
           )}
         </div>
-        <p className="hint">Customers ke reply yaha aate hain. YES/haan wale ⭐ ke saath dikhte hain.</p>
+        <p className="hint">Customers ke reply yaha aate hain. YES/haan likhne walon par YES label lagta hai.</p>
         <div className="filters">
           {[
             ['all', 'Sab'],
-            ['yes', `⭐ YES (${counts.yes})`],
+            ['yes', `YES (${counts.yes})`],
             ['unread', `Unread (${counts.unread})`],
             ['stop', `STOP (${counts.stop})`],
           ].map(([k, label]) => (
@@ -1184,14 +1326,14 @@ function Inbox() {
               >
                 <div className="conv-top">
                   <b>
-                    {c.interested && '⭐ '}
+                    {c.interested && <span className="yes-tag">YES</span>}
                     {c.name || `+${c.number}`}
                   </b>
                   <span className="hint">{fmtDate(c.lastTime)}</span>
                 </div>
                 <div className="conv-bottom">
                   <span className="conv-text">
-                    {c.lastDirection === 'out' && '↪ '}
+                    {c.lastDirection === 'out' && 'Aap: '}
                     {c.lastText}
                   </span>
                   {c.stop && <span className="pill failed">STOP</span>}
@@ -1209,20 +1351,20 @@ function Inbox() {
       {open && (
         <section className="card thread">
           <div className="thread-head">
-            <button className="icon back" onClick={() => setOpen(null)} title="Wapas">
-              ←
+            <button className="link-btn plain back" onClick={() => setOpen(null)}>
+              Wapas
             </button>
             <div className="thread-who">
               <b>{thread?.name || `+${open}`}</b>
               {(thread?.name || thread?.optedOut) && (
                 <div className="hint">
                   {thread?.name && `+${open}`}
-                  {thread?.optedOut && `${thread?.name ? ' · ' : ''}⛔ opt-out (STOP)`}
+                  {thread?.optedOut && `${thread?.name ? ' · ' : ''}opt-out (STOP)`}
                 </div>
               )}
             </div>
             <a className="link-btn plain" href={`tel:+${open}`}>
-              📞 Call
+              Call
             </a>
           </div>
 
@@ -1276,11 +1418,11 @@ function Inbox() {
 
 const SENT_FILTERS = [
   ['all', 'Sab'],
-  ['read', '👁 Read'],
-  ['delivered', '✓✓ Delivered (padha nahi)'],
-  ['sent', '✓ Sent (pahuncha nahi abhi)'],
-  ['failed', '⚠ Failed'],
-  ['replied', '💬 Reply kiya'],
+  ['read', 'Read'],
+  ['delivered', 'Delivered (padha nahi)'],
+  ['sent', 'Sent (pahuncha nahi abhi)'],
+  ['failed', 'Failed'],
+  ['replied', 'Reply kiya'],
 ];
 
 function SentStatus({ open, onOpen }) {
@@ -1371,8 +1513,8 @@ function SentStatus({ open, onOpen }) {
                     </span>
                   </div>
                   <div className="conv-bottom">
-                    <span className="conv-text">{r.error ? `⚠ ${r.error}` : r.template ? `📋 ${r.template}` : r.text}</span>
-                    {r.replied && <span className="pill dup">💬 Reply</span>}
+                    <span className="conv-text">{r.error ? `${r.error}` : r.template ? `${r.template}` : r.text}</span>
+                    {r.replied && <span className="pill dup">Reply</span>}
                   </div>
                   <div className="hint conv-num">
                     {r.name && `+${r.number} · `}

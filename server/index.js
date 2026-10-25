@@ -5,6 +5,8 @@ import crypto from 'crypto';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import { connectDB, col, clean } from './db.js';
+import { registerPlanner } from './planner.js';
+import { registerContent } from './content.js';
 import {
   cloudEnabled,
   cloudInfo,
@@ -676,6 +678,10 @@ app.post(
     res.json({ ok: true });
   })
 );
+
+// ---- weekly marketing planner ----
+registerPlanner(app, col, wrap);
+registerContent(app, col, wrap);
 
 // ---- approved templates from Meta ----
 app.get(

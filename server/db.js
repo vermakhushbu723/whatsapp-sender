@@ -17,6 +17,8 @@ export async function connectDB() {
     col.jobs().createIndex({ 'results.wamid': 1 }, { sparse: true }),
     col.messages().createIndex({ number: 1, time: 1 }),
     col.messages().createIndex({ direction: 1, read: 1 }),
+    col.planner().createIndex({ date: 1, order: 1 }),
+    col.content().createIndex({ brand: 1, date: 1 }),
   ]);
   console.log(`MongoDB connected (db: ${db.databaseName})`);
   return db;
@@ -28,6 +30,8 @@ export const col = {
   images: () => db.collection('images'), // template header posters
   optouts: () => db.collection('optouts'), // numbers that replied STOP / were blocked manually
   messages: () => db.collection('messages'), // inbox: replies from customers + what we sent them
+  planner: () => db.collection('planner'), // weekly marketing calendar tasks
+  content: () => db.collection('content'), // social media post calendar (topic, hook, caption per day)
 };
 
 // strip mongo _id from documents sent to the client
